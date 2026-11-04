@@ -78,6 +78,10 @@ export HARNESSMM_POLICY='{"version":6,"enabled":true,"maximum_candidates":16,"ma
 
 # Required by policy versions 8 and 10: {phase:"train", categories:{inspect:{phase:"train",median_tokens:12000}, ...}}
 export HARNESSMM_TRAIN_PRIORS=/path/to/priors.json
+
+# Shell used for every command. Defaults to /bin/bash on POSIX and to a Git for
+# Windows bash on win32; set it when neither is what `terminal` should use.
+export HARNESSMM_SHELL=C:/PortableGit/bin/bash.exe
 ```
 
 ## Certificates

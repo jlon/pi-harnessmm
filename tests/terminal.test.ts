@@ -7,7 +7,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtemp, realpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { DEFAULT_TIMEOUT_SEC, MODEL_OUTPUT_BYTES, modelReceiptText, receiptText, runTerminal, scrubbedEnvironment } from "../src/terminal.ts";
 
 const cwd = process.cwd();
@@ -65,6 +65,8 @@ test("the model sees a shortened receipt while guards keep the full one", async 
 test("a command runs in its own cwd without leaking into the caller's", async () => {
   const dir = await mkdtemp(join(tmpdir(), "harnessmm-cwd-"));
   const receipt = await runTerminal({ command: "pwd", cwd: dir }, { cwd });
-  // macOS resolves /tmp to /private/tmp, so compare the resolved path.
-  assert.equal(receipt.stdout.trim(), await realpath(dir));
+  // A POSIX shell reports its own view of the path (MSYS maps the Windows temp
+  // directory to /tmp), so the unique leaf name identifies the directory.
+  assert.equal(basename(receipt.stdout.trim()), basename(await realpath(dir)));
+  assert.notEqual(receipt.stdout.trim(), cwd);
 });

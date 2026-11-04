@@ -73,10 +73,19 @@ export default function harnessmm(pi: ExtensionAPI) {
   // whole system prompt, which keeps the cached prefix stable across turns.
   pi.on("before_agent_start", async (event) => {
     if (!policy.enabled) return;
-    event.systemPromptOptions.sections = {
-      ...event.systemPromptOptions.sections,
-      "harnessmm-authoring": planInstruction(policy),
-    };
+    const instruction = planInstruction(policy);
+    const options = "systemPromptOptions" in event ? event.systemPromptOptions : undefined;
+    if (options && "sections" in options && options.sections && typeof options.sections === "object") {
+      // pi: patch only this section, so the cached prompt prefix stays valid.
+      Reflect.set(options.sections, "harnessmm-authoring", instruction);
+      return;
+    }
+    // omp passes the assembled prompt as an array of sections and no prompt options,
+    // so the instruction is appended as one more section. `includes` keeps a reused
+    // array from accumulating a copy per turn.
+    const base = "systemPrompt" in event ? event.systemPrompt : undefined;
+    if (!Array.isArray(base) || base.some(part => typeof part !== "string")) return;
+    if (!base.includes(instruction)) base.push(instruction);
   });
 
   // Remove the authored bank from the slow context, preserving every native action.
@@ -266,6 +275,9 @@ export default function harnessmm(pi: ExtensionAPI) {
 
 /** Dispatch one admitted action through the registered `terminal` tool. */
 async function callNative(ctx: ExtensionToolContext, args: { command: string; cwd?: string; timeout_sec?: number }, signal?: AbortSignal): Promise<TerminalReceipt> {
+  // omp exposes no nested tool dispatch, so the admitted action runs through the
+  // same native adapter the root call uses. pi keeps the hook-visible path.
+  if (typeof ctx.executeTool !== "function") return runTerminal(args, { cwd: ctx.cwd, signal });
   const outcome = await ctx.executeTool("terminal", args, { signal });
   const text = outcome.result.content
     .filter((part): part is { type: "text"; text: string } => part.type === "text")
@@ -291,26 +303,63 @@ function previousToolCallId(messages: PiMessage[], authoringIndex: number): stri
   return undefined;
 }
 
+/** Usage shape both selector paths report. */
+interface SelectorUsage {
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+}
+
+/** A one-shot provider turn: pi's `complete` needs logprobs; omp only has this. */
+type EphemeralTurn = (options: { promptText: string; signal?: AbortSignal }) => Promise<{
+  replyText?: string;
+  assistantMessage?: { usage?: { input?: number; output?: number; totalTokens?: number } };
+}>;
+
+/**
+ * `runEphemeralTurn` exists only on omp's tool context, so it is read by name and
+ * narrowed at runtime; the cast states the shape omp's own one-shot callers use.
+ */
+function ephemeralTurn(ctx: ExtensionToolContext): EphemeralTurn | undefined {
+  if (!("runEphemeralTurn" in ctx)) return undefined;
+  const turn = ctx.runEphemeralTurn;
+  return typeof turn === "function" ? (turn as EphemeralTurn) : undefined;
+}
+
 /**
  * One-token style selector: ask the session model for a single label.
  * pi exposes no logprobs, so this verifies the reply shape instead of a
  * probability, and any other reply abstains back to slow reasoning.
  */
-async function selectLabel(ctx: ExtensionToolContext, system: string, state: unknown, labels: string[]): Promise<{ label: string; usage?: { inputTokens: number; outputTokens: number; totalTokens: number } }> {
+async function selectLabel(ctx: ExtensionToolContext, system: string, state: unknown, labels: string[]): Promise<{ label: string; usage?: SelectorUsage }> {
+  const settle = (reply: string, usage?: SelectorUsage) => (labels.includes(reply) ? { label: reply, ...(usage ? { usage } : {}) } : { label: "?", ...(usage ? { usage } : {}) });
   const model = ctx.model;
-  if (!model) return { label: "?" };
-  const context: ModelContext = {
-    systemPrompt: system,
-    messages: [{ role: "user", content: [{ type: "text", text: JSON.stringify(state) }], timestamp: Date.now() }],
-  };
-  const answer = await ctx.modelRegistry.complete(model, context, { maxTokens: 1, temperature: 0 });
-  const reply = answer.content
-    .filter((part): part is { type: "text"; text: string } => part.type === "text")
-    .map(part => part.text)
-    .join("")
-    .trim();
-  const usage = answer.usage
-    ? { inputTokens: answer.usage.input ?? 0, outputTokens: answer.usage.output ?? 0, totalTokens: answer.usage.totalTokens ?? 0 }
-    : undefined;
-  return labels.includes(reply) ? { label: reply, ...(usage ? { usage } : {}) } : { label: "?", ...(usage ? { usage } : {}) };
+  const registry = ctx.modelRegistry;
+  if (model && registry && typeof registry.complete === "function") {
+    const context: ModelContext = {
+      systemPrompt: system,
+      messages: [{ role: "user", content: [{ type: "text", text: JSON.stringify(state) }], timestamp: Date.now() }],
+    };
+    const answer = await registry.complete(model, context, { maxTokens: 1, temperature: 0 });
+    const reply = answer.content
+      .filter((part): part is { type: "text"; text: string } => part.type === "text")
+      .map(part => part.text)
+      .join("")
+      .trim();
+    return settle(
+      reply,
+      answer.usage
+        ? { inputTokens: answer.usage.input ?? 0, outputTokens: answer.usage.output ?? 0, totalTokens: answer.usage.totalTokens ?? 0 }
+        : undefined,
+    );
+  }
+  // omp selects through a one-shot turn; a host with neither primitive abstains.
+  const turn = ephemeralTurn(ctx);
+  if (!turn) return { label: "?" };
+  const answer = await turn({ promptText: `${system}\n\n${JSON.stringify(state)}` });
+  const raw = answer.assistantMessage?.usage;
+  return settle(
+    (answer.replyText ?? "").trim(),
+    raw ? { inputTokens: raw.input ?? 0, outputTokens: raw.output ?? 0, totalTokens: raw.totalTokens ?? 0 } : undefined,
+  );
 }

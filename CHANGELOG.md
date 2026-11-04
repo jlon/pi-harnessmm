@@ -1,5 +1,21 @@
 # Changelog
 
+## [Unreleased]
+
+Compatibility fixes for omp (oh-my-pi) and Windows. Behaviour on pi is unchanged.
+
+- `terminal` resolves its shell instead of hardcoding `/bin/bash`: `HARNESSMM_SHELL`, then the POSIX path, then a
+  Git for Windows bash. No resolution returns a 127 receipt naming `HARNESSMM_SHELL` instead of an ENOENT spawn.
+- `timeout_sec` and abort kill the whole process tree on win32 (`taskkill /t /f`); a timed-out command used to keep
+  running until it finished on its own.
+- `before_agent_start` keeps pi's sections path and appends the authoring instruction as one more section when a host
+  passes the assembled prompt as an array (omp), instead of throwing on a missing `systemPromptOptions`.
+- Candidates are validated against the extension's terminal contract when the host's tool `parameters` is an opaque
+  builder rather than JSON Schema (omp), so a bank is no longer rejected as `arguments_do_not_match_tool_schema`.
+- Admitted actions go through `runTerminal` when the host exposes no nested `ctx.executeTool` (omp).
+- A rejected bank names the rule it violated (`unknown_predecessor`, `arguments_do_not_match_tool_schema`, ...).
+- The cwd test compares the directory leaf name, so shells that report `/tmp` for the Windows temp directory pass.
+
 ## [0.1.0] - 2026-11-02
 
 Initial port of HarnessMM (arXiv 2610.32813) to pi.

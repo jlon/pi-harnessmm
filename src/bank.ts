@@ -157,6 +157,19 @@ export interface ToolContract {
 }
 
 /**
+ * Candidate arguments must match the registered tool. A host hands back either
+ * JSON Schema (pi's typebox objects) or an opaque builder (omp resolves `typebox`
+ * to a schema factory), so a non-object contract falls back to the terminal
+ * contract this extension owns rather than accepting every candidate.
+ */
+function matchesToolContract(candidate: Record<string, unknown>, tools: ToolContract[]): boolean {
+  if (!object(candidate.arguments) || typeof candidate.tool !== "string") return false;
+  const tool = tools.find(item => item.name === candidate.tool);
+  if (!tool) return false;
+  return object(tool.parameters) ? schemaMatches(candidate.arguments, tool.parameters) : terminalArguments(candidate.arguments);
+}
+
+/**
  * Parse the single action bank a slow turn authored.
  * Returns null when the turn declares no bank; throws BankContractError when it
  * declares one that violates the frozen contract.
@@ -246,21 +259,34 @@ export function parseBank(message: AuthoringMessage | null, policy: Policy, tool
       candidate.after = candidate.predecessor_id;
       candidate.condition = JSON.stringify(candidate.guard);
     }
-    if (
-      !object(candidate) ||
-      Object.keys(candidate).sort().join() !== (policy.version >= 6 ? Object.keys(candidate).sort().join() : "after,arguments,condition,label,tool") ||
-      typeof candidate.label !== "string" ||
-      candidate.label.length !== 1 ||
-      !LABELS.slice(0, policy.maximum_candidates).includes(candidate.label) ||
-      declared.has(candidate.label) ||
-      !declared.has(candidate.after) ||
-      typeof candidate.condition !== "string" ||
-      !candidate.condition.trim() ||
-      (policy.version < 3 && (candidate.tool !== "terminal" || !terminalArguments(candidate.arguments))) ||
-      (policy.version >= 3 &&
-        (!object(candidate.arguments) || !tools.some(tool => tool.name === candidate.tool && schemaMatches(candidate.arguments, tool.parameters))))
-    ) {
-      throw new BankContractError("Invalid, cyclic, duplicate or unsupported CoT-authored candidate");
+    // Name the first violated rule: one sentence for six different failures makes a
+    // rejected bank impossible to debug from the ledger.
+    const invalid: string | null =
+      !object(candidate)
+        ? "not_an_object"
+        : policy.version < 6 && Object.keys(candidate).sort().join() !== "after,arguments,condition,label,tool"
+          ? "unexpected_keys"
+          : typeof candidate.label !== "string"
+            ? "label_not_string"
+            : candidate.label.length !== 1
+              ? "label_not_single_character"
+              : !LABELS.slice(0, policy.maximum_candidates).includes(candidate.label)
+                ? "label_out_of_range"
+                : declared.has(candidate.label)
+                  ? "duplicate_label"
+                  : !declared.has(candidate.after)
+                    ? "unknown_predecessor"
+                    : typeof candidate.condition !== "string" || !candidate.condition.trim()
+                      ? "empty_condition"
+                      : policy.version < 3 && (candidate.tool !== "terminal" || !terminalArguments(candidate.arguments))
+                        ? "unsupported_native_tool"
+                        : policy.version >= 3 && !object(candidate.arguments)
+                          ? "arguments_not_object"
+                          : policy.version >= 3 && !matchesToolContract(candidate, tools)
+                            ? "arguments_do_not_match_tool_schema"
+                            : null;
+    if (invalid) {
+      throw new BankContractError(`Invalid, cyclic, duplicate or unsupported CoT-authored candidate: ${invalid}`);
     }
     if (policy.version >= 4 && candidate.after === "root" && candidate.tool === roots[0].name && isDeepStrictEqual(candidate.arguments, rootArguments)) {
       throw new BankContractError("A future candidate cannot repeat the already executed native root");

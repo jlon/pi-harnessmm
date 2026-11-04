@@ -6,7 +6,7 @@
  * that receipt as JSON text. Arguments and receipt shape match the frozen
  * `terminal` contract (`command`, `cwd`, `timeout_sec`).
  */
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 
 /** Maximum bytes of each stream kept in the receipt; the rest is dropped with a marker. */
@@ -36,13 +36,44 @@ export interface TerminalRequest {
   timeout_sec?: number;
 }
 
+/**
+ * POSIX shells an installed Git for Windows provides. Only consulted on win32,
+ * where `/bin/bash` never exists; `HARNESSMM_SHELL` overrides the whole search.
+ */
+const WINDOWS_SHELL_CANDIDATES = [
+  "C:\\PortableGit\\bin\\bash.exe",
+  "C:\\Program Files\\Git\\bin\\bash.exe",
+  "C:\\Program Files (x86)\\Git\\bin\\bash.exe",
+];
+
+/**
+ * Resolve the shell for one command.
+ * `HARNESSMM_SHELL` wins, then the POSIX path, then a Windows Git bash. `null`
+ * means no usable shell, which becomes an explicit receipt instead of ENOENT.
+ */
+export function resolveShell(): string | null {
+  const override = process.env.HARNESSMM_SHELL?.trim();
+  if (override) return override;
+  if (process.platform !== "win32") return "/bin/bash";
+  return WINDOWS_SHELL_CANDIDATES.find(candidate => existsSync(candidate)) ?? null;
+}
+
 /** Run one command and return its closed receipt. Never throws for a failing command. */
 export async function runTerminal(request: TerminalRequest, options: { cwd: string; signal?: AbortSignal; shell?: string }): Promise<TerminalReceipt> {
   const cwd = request.cwd ?? options.cwd;
   if (!existsSync(cwd)) {
     return { return_code: 1, stdout: "", stderr: `working directory does not exist: ${cwd}` };
   }
-  const shell = options.shell ?? "/bin/bash";
+  // An unresolvable shell is reported like any other failed command, so guards see
+  // a readable receipt and the model learns to set HARNESSMM_SHELL.
+  const shell = options.shell ?? resolveShell();
+  if (!shell) {
+    return {
+      return_code: 127,
+      stdout: "",
+      stderr: "no POSIX shell found; set HARNESSMM_SHELL to a bash executable (for example C:\\PortableGit\\bin\\bash.exe)",
+    };
+  }
   const child = spawn(shell, ["-c", request.command], {
     cwd,
     env: scrubbedEnvironment(),
@@ -110,6 +141,11 @@ function tail(text: string): string {
 }
 
 function killTree(pid: number): void {
+  if (process.platform === "win32") {
+    // Windows has no process groups to signal, so the whole tree is killed by pid.
+    spawnSync("taskkill", ["/pid", String(pid), "/t", "/f"], { stdio: "ignore" });
+    return;
+  }
   try {
     process.kill(-pid, "SIGKILL");
   } catch {
